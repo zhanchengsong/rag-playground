@@ -1,0 +1,9 @@
+# caches & generated artifacts
+data/embeddings.npy
+data/index_meta.json
+data/essays/
+embedding_space*.png
+__pycache__/
+*.pyc
+.venv/
+venv/
