@@ -3,6 +3,8 @@ data/embeddings.npy
 data/index_meta.json
 data/essays/
 embedding_space*.png
+.serve/
+models/
 __pycache__/
 *.pyc
 .venv/

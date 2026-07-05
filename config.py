@@ -16,7 +16,7 @@ import os
 # both URLs at the same address.
 API_KEY        = os.getenv("API_KEY", "local-no-key")
 CHAT_BASE_URL  = os.getenv("CHAT_BASE_URL",  "http://localhost:8080/v1")
-EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "http://localhost:8080/v1")
+EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "http://localhost:8081/v1")
 
 # Model names. llama.cpp largely ignores this field, so any string works; set
 # it to whatever your MLX/vLLM server expects if you switch backends.

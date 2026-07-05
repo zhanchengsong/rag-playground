@@ -72,6 +72,7 @@ def build_index(rebuild=False):
 
     print(f"[index] embedding {len(chunks)} chunks via {config.EMBED_BASE_URL} ...")
     mat = embed_texts([c["text"] for c in chunks], is_query=False)
+    os.makedirs(config.CACHE_DIR, exist_ok=True)
     np.save(VEC_PATH, mat)
     with open(META_PATH, "w") as f:
         json.dump({"meta": meta, "chunks": chunks}, f)
