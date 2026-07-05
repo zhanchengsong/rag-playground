@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a transformer predicts the next token</title>
+<style>
+:root{
+  --surface-0:#f5f4ef; --surface-1:#fcfcfb; --surface-2:#ffffff;
+  --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#898781;
+  --border:rgba(11,11,11,0.10);
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --surface-0:#111110; --surface-1:#1a1a19; --surface-2:#222221;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#898781;
+    --border:rgba(255,255,255,0.10);
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--surface-0);color:var(--text-primary);font-family:var(--font-sans);line-height:1.6}
+.page{max-width:760px;margin:0 auto;padding:2.5rem 1.25rem 5rem}
+h1{font-size:26px;font-weight:500;margin:0 0 .5rem}
+h2{font-size:19px;font-weight:500;margin:2.75rem 0 .5rem}
+p.lead{font-size:14px;color:var(--text-secondary);margin:0 0 .75rem}
+p.toc{font-size:13px;color:var(--text-muted);margin:0 0 1.5rem}
+.eqcard{background:var(--surface-1);border:0.5px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:10px}
+.eqcard .lbl{font-size:11px;color:var(--text-muted);margin-bottom:4px}
+.eqcard .eq{font-family:var(--font-mono);font-size:13px;color:var(--text-primary);line-height:1.8;overflow-wrap:break-word}
+.controls{display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap}
+.stepn{font-size:13px;font-weight:500;color:var(--text-primary)}
+.cap{font-size:14px;color:var(--text-secondary);min-height:44px;margin-bottom:6px}
+button{font-family:var(--font-sans);font-size:13px;color:var(--text-primary);background:transparent;border:0.5px solid var(--text-muted);border-radius:8px;padding:6px 12px;cursor:pointer;min-width:44px}
+button:hover{background:var(--surface-1)}
+button:active{transform:scale(0.98)}
+input[type=range]{accent-color:#7F77DD}
+label{font-size:12px;color:var(--text-secondary)}
+table{width:100%;table-layout:fixed;font-size:13px;border-collapse:collapse}
+td{padding:6px 8px}
+tr.hd td{color:var(--text-muted);font-size:12px;border-bottom:0.5px solid var(--border)}
+td.sym{font-family:var(--font-mono)}
+td.mean{color:var(--text-secondary)}
+svg{display:block;width:100%;height:auto}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+footer{margin-top:3rem;font-size:12px;color:var(--text-muted)}
+</style>
+</head>
+<body>
+<div class="page">
+<h1>How a transformer predicts the next token</h1>
+<p class="lead">Running example: <span style="font-family:var(--font-mono)">&ldquo;the bank raised rates&rdquo; &rarr; &ldquo;sharply&rdquo;</span>, on Qwen3-8B (d=4096, 36 layers, 32 q-heads / 8 kv-heads, d_ff=12288).</p>
+<p class="toc">1 &middot; big picture &amp; the layer stack &mdash; 2 &middot; inside one layer (KV cache) &mdash; 3 &middot; attention heads &amp; GQA &mdash; 4 &middot; the FFN &mdash; 5 &middot; the equations</p>
+
+<h2>1 &middot; Big picture &mdash; the layer stack</h2>
+<p class="lead">Each layer owns its matrices and computes fresh q, k, v from the evolving stream. The only thing layers share is the hidden state h flowing between them. Click any token to follow a different token&rsquo;s query.</p>
+<div class="eqcard"><div class="lbl">canonical form</div>
+<div class="eq">H&#8304; = E[ids] &nbsp;&middot;&nbsp; H&#737; = H&#737;&#8315;&#185; + MHA(RMSNorm(H&#737;&#8315;&#185;)) + FFN(RMSNorm(&middot;)) &nbsp;&middot;&nbsp; p = softmax(W<sub>head</sub>&middot;h<sup>L</sup><sub>last</sub>)</div></div>
+<div class="controls">
+<button id="aprev" aria-label="previous step">&#9664;</button>
+<button id="aplay" style="min-width:70px;">pause</button>
+<button id="anext" aria-label="next step">&#9654;</button>
+<span id="astepn" class="stepn"></span>
+</div>
+<div id="acap" class="cap"></div>
+<div class="eqcard"><div class="lbl">computing (live)</div><div id="aformula" class="eq" style="line-height:1.6"></div></div>
+<svg viewBox="0 0 680 645" role="img" aria-label="Two stacked decoder layers each computing their own attention, then the output head">
+<defs>
+<marker id="amg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#888780"/></marker>
+<marker id="amp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7F77DD"/></marker>
+<marker id="amt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1D9E75"/></marker>
+</defs>
+<g id="atk0" style="opacity:0;transition:opacity .4s;cursor:pointer;"><rect id="atkr0" x="90" y="14" width="100" height="40" rx="6" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="140" y="33" text-anchor="middle" font-size="13" font-weight="500" fill="var(--text-primary)" style="pointer-events:none">the</text><text x="140" y="48" text-anchor="middle" font-size="11" fill="var(--text-muted)" style="pointer-events:none">id 1782</text></g>
+<g id="atk1" style="opacity:0;transition:opacity .4s;cursor:pointer;"><rect id="atkr1" x="210" y="14" width="100" height="40" rx="6" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="260" y="33" text-anchor="middle" font-size="13" font-weight="500" fill="var(--text-primary)" style="pointer-events:none">bank</text><text x="260" y="48" text-anchor="middle" font-size="11" fill="var(--text-muted)" style="pointer-events:none">id 17032</text></g>
+<g id="atk2" style="opacity:0;transition:opacity .4s;cursor:pointer;"><rect id="atkr2" x="330" y="14" width="100" height="40" rx="6" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="380" y="33" text-anchor="middle" font-size="13" font-weight="500" fill="var(--text-primary)" style="pointer-events:none">raised</text><text x="380" y="48" text-anchor="middle" font-size="11" fill="var(--text-muted)" style="pointer-events:none">id 9226</text></g>
+<g id="atk3" style="opacity:0;transition:opacity .4s;cursor:pointer;"><rect id="atkr3" x="450" y="14" width="100" height="40" rx="6" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="500" y="33" text-anchor="middle" font-size="13" font-weight="500" fill="var(--text-primary)" style="pointer-events:none">rates</text><text x="500" y="48" text-anchor="middle" font-size="11" fill="var(--text-muted)" style="pointer-events:none">id 7813</text></g>
+<g id="atk4" style="opacity:0;transition:opacity .4s;"><rect x="572" y="14" width="96" height="40" rx="6" fill="rgba(127,119,221,.14)" stroke="#7F77DD" stroke-width="1.2"/><text x="620" y="33" text-anchor="middle" font-size="13" font-weight="500" fill="var(--text-primary)">sharply</text><text x="620" y="48" text-anchor="middle" font-size="11" fill="var(--text-muted)">new token</text></g>
+<g id="aarre" style="opacity:0;transition:opacity .4s">
+<line x1="140" y1="56" x2="140" y2="64" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="260" y1="56" x2="260" y2="64" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="380" y1="56" x2="380" y2="64" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="500" y1="56" x2="500" y2="64" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+</g>
+<g id="ah0row" style="opacity:0;transition:opacity .4s">
+<rect x="90" y="68" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="140" y="84" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#8304; 4096-d</text>
+<rect x="210" y="68" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="260" y="84" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#8304;</text>
+<rect x="330" y="68" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="380" y="84" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#8304;</text>
+<rect x="450" y="68" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="500" y="84" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#8304;</text>
+</g>
+<g id="ablk1" style="opacity:0;transition:opacity .4s">
+<line x1="140" y1="92" x2="140" y2="100" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="260" y1="92" x2="260" y2="100" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="380" y1="92" x2="380" y2="100" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="500" y1="92" x2="500" y2="100" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<rect x="70" y="104" width="540" height="150" rx="8" fill="rgba(136,135,128,.05)" stroke="#888780" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="86" y="122" font-size="12" font-weight="500" fill="var(--text-primary)">layer 1</text>
+<text x="594" y="122" text-anchor="end" font-size="11" fill="var(--text-muted)">own W_Q&#8317;&#185;&#8318;, W_K&#8317;&#185;&#8318;, W_V&#8317;&#185;&#8318;</text>
+<circle id="anc0" cx="140" cy="140" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+<circle id="anc1" cx="260" cy="140" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+<circle id="anc2" cx="380" cy="140" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+<circle id="anc3" cx="500" cy="140" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+</g>
+<g id="ah1row" style="opacity:0;transition:opacity .4s">
+<line x1="140" y1="254" x2="140" y2="260" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="260" y1="254" x2="260" y2="260" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="380" y1="254" x2="380" y2="260" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="500" y1="254" x2="500" y2="260" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<rect x="90" y="262" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="140" y="278" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#185; = h&#8304; + &Delta;</text>
+<rect x="210" y="262" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="260" y="278" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#185;</text>
+<rect x="330" y="262" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="380" y="278" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#185;</text>
+<rect x="450" y="262" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="500" y="278" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#185;</text>
+</g>
+<g id="ablk2" style="opacity:0;transition:opacity .4s">
+<line x1="140" y1="286" x2="140" y2="294" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="260" y1="286" x2="260" y2="294" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="380" y1="286" x2="380" y2="294" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="500" y1="286" x2="500" y2="294" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<rect x="70" y="298" width="540" height="150" rx="8" fill="rgba(136,135,128,.05)" stroke="#888780" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="86" y="316" font-size="12" font-weight="500" fill="var(--text-primary)">layer 2</text>
+<text x="594" y="316" text-anchor="end" font-size="11" fill="var(--text-muted)">own W_Q&#8317;&#178;&#8318;, W_K&#8317;&#178;&#8318;, W_V&#8317;&#178;&#8318; &mdash; nothing reused</text>
+<circle id="amc0" cx="140" cy="334" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+<circle id="amc1" cx="260" cy="334" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+<circle id="amc2" cx="380" cy="334" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+<circle id="amc3" cx="500" cy="334" r="9" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.5"/>
+</g>
+<g id="ah2row" style="opacity:0;transition:opacity .4s">
+<line x1="140" y1="448" x2="140" y2="454" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="260" y1="448" x2="260" y2="454" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="380" y1="448" x2="380" y2="454" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<line x1="500" y1="448" x2="500" y2="454" stroke="#888780" stroke-width="1.3" marker-end="url(#amg)"/>
+<rect x="90" y="458" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="140" y="474" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#178; = h&#185; + &Delta;</text>
+<rect x="210" y="458" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="260" y="474" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#178;</text>
+<rect x="330" y="458" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="380" y="474" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#178;</text>
+<rect x="450" y="458" width="100" height="24" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/><text x="500" y="474" text-anchor="middle" font-size="12" fill="var(--text-primary)">h&#178;</text>
+<text x="340" y="498" text-anchor="middle" font-size="12" fill="var(--text-muted)">&#8942; layers 3&hellip;36 &mdash; 34 more, each with its own W_Q, W_K, W_V and fresh q, k, v</text>
+<rect x="450" y="506" width="100" height="24" rx="4" fill="rgba(127,119,221,.14)" stroke="#7F77DD" stroke-width="1.4"/><text x="500" y="522" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)">h&#179;&#8310; &middot; used</text>
+</g>
+<g id="aheadarrow" style="opacity:0;transition:opacity .4s">
+<path d="M 500 530 C 500 548, 430 554, 346 560" fill="none" stroke="#7F77DD" stroke-width="1.5" marker-end="url(#amp)"/>
+<text x="464" y="552" font-size="11" fill="var(--text-muted)">&times; W_head &rarr; softmax</text>
+</g>
+<g id="abarsg" style="opacity:0;transition:opacity .4s">
+<text x="140" y="565" text-anchor="end" font-size="12" font-weight="500" fill="var(--text-primary)">sharply</text>
+<rect id="abar0" x="150" y="554" width="193" height="13" rx="2" fill="#7F77DD" style="transform:scaleX(0);transform-box:fill-box;transform-origin:left;transition:transform .7s"/>
+<text x="351" y="565" font-size="11" fill="var(--text-muted)">42%</text>
+<text x="140" y="587" text-anchor="end" font-size="12" fill="var(--text-secondary)">again</text>
+<rect id="abar1" x="150" y="576" width="83" height="13" rx="2" fill="rgba(136,135,128,.55)" style="transform:scaleX(0);transform-box:fill-box;transform-origin:left;transition:transform .7s"/>
+<text x="241" y="587" font-size="11" fill="var(--text-muted)">18%</text>
+<text x="140" y="609" text-anchor="end" font-size="12" fill="var(--text-secondary)">by</text>
+<rect id="abar2" x="150" y="598" width="55" height="13" rx="2" fill="rgba(136,135,128,.55)" style="transform:scaleX(0);transform-box:fill-box;transform-origin:left;transition:transform .7s"/>
+<text x="213" y="609" font-size="11" fill="var(--text-muted)">12%</text>
+<text x="140" y="631" text-anchor="end" font-size="11" fill="var(--text-muted)">and 151,933 more&hellip;</text>
+</g>
+<path id="alooparrow" d="M 355 560 C 580 540, 665 240, 623 58" fill="none" stroke="#7F77DD" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#amp)" style="opacity:0;transition:opacity .4s"/>
+<g id="adyn"></g>
+</svg>
+
+<h2>2 &middot; Inside one layer &mdash; the KV cache view</h2>
+<p class="lead">The same block, zoomed in: one new token, one layer, during generation. Keys and values are cached per layer; the query is used once and discarded. Drag the layer slider &mdash; different layer, different W&#8317;&#737;&#8318;, different weights.</p>
+<div class="eqcard"><div class="lbl">canonical form</div>
+<div class="eq">Attention(Q, K, V) = softmax(QK&#7488; / &radic;d<sub>k</sub> + M)&middot;V &nbsp;&middot;&nbsp; M<sub>ij</sub> = &minus;&infin; for j &gt; i (causal mask)</div></div>
+<div class="controls">
+<button id="bprev2" aria-label="previous step">&#9664;</button>
+<button id="bplay2" style="min-width:70px;">pause</button>
+<button id="bnext2" aria-label="next step">&#9654;</button>
+<span id="bstepn" class="stepn"></span>
+<span style="display:flex;align-items:center;gap:8px;margin-left:auto;">
+<label for="bslider">layer</label>
+<input id="bslider" type="range" min="1" max="36" value="12" step="1" style="width:120px;"/>
+<span id="blval" class="stepn" style="min-width:22px;">12</span>
+</span>
+</div>
+<div id="bcap" class="cap"></div>
+<div class="eqcard"><div class="lbl">computing (live)</div><div id="bformula" class="eq" style="line-height:1.6"></div></div>
+<svg viewBox="0 0 680 460" role="img" aria-label="One decoder layer processing the new token sharply with its KV cache">
+<defs>
+<marker id="bmg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#888780"/></marker>
+<marker id="bmp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7F77DD"/></marker>
+<marker id="bmt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1D9E75"/></marker>
+</defs>
+<g id="btok" style="opacity:0;transition:opacity .4s">
+<rect x="90" y="14" width="140" height="40" rx="6" fill="rgba(127,119,221,.14)" stroke="#7F77DD" stroke-width="1.2"/>
+<text x="160" y="33" text-anchor="middle" font-size="13" font-weight="500" fill="var(--text-primary)">sharply</text>
+<text x="160" y="48" text-anchor="middle" font-size="11" fill="var(--text-muted)">new token &middot; position 5</text>
+<line x1="160" y1="54" x2="160" y2="62" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+</g>
+<g id="bh" style="opacity:0;transition:opacity .4s">
+<rect x="80" y="64" width="160" height="26" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/>
+<text x="160" y="81" text-anchor="middle" font-size="12" fill="var(--text-primary)" id="bhin">h &mdash; from layer 11</text>
+</g>
+<g id="bcache" style="opacity:0;transition:opacity .4s">
+<rect x="380" y="64" width="260" height="236" rx="8" fill="rgba(136,135,128,.05)" stroke="#888780" stroke-width="1" stroke-dasharray="6 4"/>
+<text x="396" y="86" font-size="12" font-weight="500" fill="var(--text-primary)" id="bclabel">KV cache &mdash; layer 12 only</text>
+<text x="396" y="114" font-size="11" fill="var(--text-secondary)">the</text>
+<rect x="500" y="100" width="34" height="20" rx="3" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1"/><text x="517" y="114" text-anchor="middle" font-size="11" fill="var(--text-primary)">k&#8321;</text>
+<rect x="550" y="100" width="34" height="20" rx="3" fill="none" stroke="#1D9E75" stroke-width="1" stroke-dasharray="3 2"/><text x="567" y="114" text-anchor="middle" font-size="11" fill="var(--text-primary)">v&#8321;</text>
+<text x="396" y="152" font-size="11" fill="var(--text-secondary)">bank</text>
+<rect x="500" y="138" width="34" height="20" rx="3" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1"/><text x="517" y="152" text-anchor="middle" font-size="11" fill="var(--text-primary)">k&#8322;</text>
+<rect x="550" y="138" width="34" height="20" rx="3" fill="none" stroke="#1D9E75" stroke-width="1" stroke-dasharray="3 2"/><text x="567" y="152" text-anchor="middle" font-size="11" fill="var(--text-primary)">v&#8322;</text>
+<text x="396" y="190" font-size="11" fill="var(--text-secondary)">raised</text>
+<rect x="500" y="176" width="34" height="20" rx="3" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1"/><text x="517" y="190" text-anchor="middle" font-size="11" fill="var(--text-primary)">k&#8323;</text>
+<rect x="550" y="176" width="34" height="20" rx="3" fill="none" stroke="#1D9E75" stroke-width="1" stroke-dasharray="3 2"/><text x="567" y="190" text-anchor="middle" font-size="11" fill="var(--text-primary)">v&#8323;</text>
+<text x="396" y="228" font-size="11" fill="var(--text-secondary)">rates</text>
+<rect x="500" y="214" width="34" height="20" rx="3" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1"/><text x="517" y="228" text-anchor="middle" font-size="11" fill="var(--text-primary)">k&#8324;</text>
+<rect x="550" y="214" width="34" height="20" rx="3" fill="none" stroke="#1D9E75" stroke-width="1" stroke-dasharray="3 2"/><text x="567" y="228" text-anchor="middle" font-size="11" fill="var(--text-primary)">v&#8324;</text>
+<text x="510" y="292" text-anchor="middle" font-size="11" fill="var(--text-muted)">one such cache per layer &mdash; 36 in total</text>
+</g>
+<g id="brow5" style="opacity:0;transition:opacity .4s">
+<text x="396" y="266" font-size="11" font-weight="500" fill="var(--text-primary)">sharply</text>
+<rect x="500" y="252" width="34" height="20" rx="3" fill="rgba(127,119,221,.2)" stroke="#7F77DD" stroke-width="1.2"/><text x="517" y="266" text-anchor="middle" font-size="11" fill="var(--text-primary)">k&#8325;</text>
+<rect x="550" y="252" width="34" height="20" rx="3" fill="rgba(127,119,221,.1)" stroke="#7F77DD" stroke-width="1.2" stroke-dasharray="3 2"/><text x="567" y="266" text-anchor="middle" font-size="11" fill="var(--text-primary)">v&#8325;</text>
+</g>
+<g id="bnorm" style="opacity:0;transition:opacity .4s">
+<line x1="160" y1="90" x2="160" y2="100" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+<rect x="85" y="102" width="150" height="24" rx="12" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/>
+<text x="160" y="118" text-anchor="middle" font-size="12" fill="var(--text-primary)">x&#770; = RMSNorm(h)</text>
+</g>
+<g id="bchips" style="opacity:0;transition:opacity .4s">
+<line x1="160" y1="126" x2="160" y2="148" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+<rect x="92" y="150" width="36" height="24" rx="3" fill="rgba(127,119,221,.22)" stroke="#7F77DD" stroke-width="1.5"/><text x="110" y="166" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)">q</text>
+<rect x="142" y="150" width="36" height="24" rx="3" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1"/><text x="160" y="166" text-anchor="middle" font-size="12" fill="var(--text-primary)">k</text>
+<rect x="192" y="150" width="36" height="24" rx="3" fill="none" stroke="#1D9E75" stroke-width="1" stroke-dasharray="3 2"/><text x="210" y="166" text-anchor="middle" font-size="12" fill="var(--text-primary)">v</text>
+</g>
+<g id="bkv" style="opacity:0;transition:opacity .4s">
+<path d="M 178 162 C 320 180, 420 230, 496 260" fill="none" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#bmt)"/>
+<path d="M 228 166 C 340 200, 460 240, 546 262" fill="none" stroke="#1D9E75" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#bmt)"/>
+<text x="330" y="205" font-size="11" fill="var(--text-muted)">append to cache</text>
+</g>
+<g id="bdyn"></g>
+<g id="bblend" style="opacity:0;transition:opacity .4s">
+<polyline points="80,77 56,77 56,284 145,284" fill="none" stroke="#888780" stroke-width="1.2" marker-end="url(#bmg)"/>
+<text x="50" y="190" font-size="11" fill="var(--text-muted)" transform="rotate(-90 50 190)">residual: h carried over</text>
+<circle cx="160" cy="240" r="13" fill="rgba(127,119,221,.18)" stroke="#7F77DD" stroke-width="1.5"/>
+<text x="160" y="245" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)">&Sigma;</text>
+<line x1="160" y1="253" x2="160" y2="271" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+<text x="172" y="266" font-size="11" fill="var(--text-muted)">&times; W_O</text>
+<circle cx="160" cy="284" r="11" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1.3"/>
+<text x="160" y="289" text-anchor="middle" font-size="12" fill="var(--text-primary)">+</text>
+</g>
+<g id="bffn" style="opacity:0;transition:opacity .4s">
+<line x1="160" y1="295" x2="160" y2="314" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+<rect x="75" y="316" width="170" height="28" rx="4" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.2"/>
+<text x="160" y="334" text-anchor="middle" font-size="12" fill="var(--text-primary)">FFN 4096 &rarr; 12k &rarr; 4096</text>
+<line x1="160" y1="344" x2="160" y2="358" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+<circle cx="160" cy="370" r="11" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1.3"/>
+<text x="160" y="375" text-anchor="middle" font-size="12" fill="var(--text-primary)">+</text>
+</g>
+<g id="bout" style="opacity:0;transition:opacity .4s">
+<line x1="160" y1="381" x2="160" y2="394" stroke="#888780" stroke-width="1.3" marker-end="url(#bmg)"/>
+<rect x="80" y="396" width="160" height="26" rx="4" fill="rgba(127,119,221,.14)" stroke="#7F77DD" stroke-width="1.2"/>
+<text x="160" y="413" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)" id="bhout">h &mdash; to layer 13</text>
+<text x="340" y="446" text-anchor="middle" font-size="12" fill="var(--text-muted)">q used once and discarded &mdash; k&#8325;, v&#8325; remain cached for the next token</text>
+</g>
+</svg>
+
+<h2>3 &middot; Attention heads &mdash; grouped-query attention</h2>
+<p class="lead">The single q/k/v shown above is really 32 parallel heads, each a 128-d slice of the projection matrices. Qwen3 groups them: every 4 query heads share one k/v head, shrinking the KV cache 4&times;.</p>
+<div class="eqcard"><div class="lbl">canonical form</div>
+<div class="eq">head<sub>i</sub> = Attention(x&#770;W<sub>Q</sub><sup>(i)</sup>, X&#770;W<sub>K</sub><sup>(g(i))</sup>, X&#770;W<sub>V</sub><sup>(g(i))</sup>), g(i) = &lceil;i/4&rceil;<br>MHA(x&#770;) = Concat(head&#8321; &hellip; head&#8323;&#8322;)&middot;W<sub>O</sub></div></div>
+<svg viewBox="0 0 680 262" role="img" aria-label="32 query heads grouped four per shared key value head, concatenated and projected by W O">
+<defs><marker id="hmg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#888780"/></marker></defs>
+<text x="46" y="52" text-anchor="end" font-size="11" fill="var(--text-muted)">32 q</text>
+<text x="46" y="100" text-anchor="end" font-size="11" fill="var(--text-muted)">8 k/v</text>
+<g id="hgroups"></g>
+<rect x="55" y="160" width="570" height="26" rx="4" fill="rgba(127,119,221,.14)" stroke="#7F77DD" stroke-width="1.2"/>
+<text x="340" y="177" text-anchor="middle" font-size="12" fill="var(--text-primary)">Concat(head&#8321; &hellip; head&#8323;&#8322;) &mdash; 32 &times; 128 = 4096</text>
+<line x1="340" y1="186" x2="340" y2="202" stroke="#888780" stroke-width="1.3" marker-end="url(#hmg)"/>
+<rect x="250" y="204" width="180" height="34" rx="4" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/>
+<text x="340" y="225" text-anchor="middle" font-size="12" fill="var(--text-primary)">&times; W_O &rarr; residual stream</text>
+<text x="340" y="256" text-anchor="middle" font-size="11" fill="var(--text-muted)">each square = one head&rsquo;s 128-d slice &middot; k/v cached, q never cached</text>
+</svg>
+
+<h2>4 &middot; The FFN &mdash; the block&rsquo;s true hidden layer</h2>
+<p class="lead">After attention routes information between tokens, the FFN processes each token alone &mdash; the classic weighted-products-through-a-nonlinearity hidden layer, holding ~&#8532; of all parameters.</p>
+<div class="eqcard"><div class="lbl">canonical form</div>
+<div class="eq">FFN&#8322;&#8320;&#8321;&#8327;(x) = max(0, xW&#8321; + b&#8321;)&middot;W&#8322;<br>FFN_SwiGLU(x) = ( SiLU(xW<sub>gate</sub>) &#8857; xW<sub>up</sub> )&middot;W<sub>down</sub> &nbsp;&nbsp;&larr; Qwen3</div></div>
+<svg viewBox="0 0 680 250" role="img" aria-label="SwiGLU feed forward network dataflow: gate and up projections, SiLU, elementwise product, down projection">
+<defs><marker id="fmg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#888780"/></marker></defs>
+<rect x="270" y="14" width="140" height="26" rx="13" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/>
+<text x="340" y="31" text-anchor="middle" font-size="12" fill="var(--text-primary)">x&#770;&prime; = RMSNorm(h) &middot; 4096</text>
+<line x1="340" y1="40" x2="212" y2="64" stroke="#888780" stroke-width="1.3" marker-end="url(#fmg)"/>
+<line x1="340" y1="40" x2="468" y2="64" stroke="#888780" stroke-width="1.3" marker-end="url(#fmg)"/>
+<rect x="135" y="66" width="150" height="40" rx="4" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.2"/>
+<text x="210" y="83" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)">&times; W_gate</text>
+<text x="210" y="98" text-anchor="middle" font-size="11" fill="var(--text-secondary)">&rarr; 12288</text>
+<rect x="395" y="66" width="150" height="40" rx="4" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.2"/>
+<text x="470" y="83" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)">&times; W_up</text>
+<text x="470" y="98" text-anchor="middle" font-size="11" fill="var(--text-secondary)">&rarr; 12288</text>
+<line x1="210" y1="106" x2="210" y2="122" stroke="#888780" stroke-width="1.3" marker-end="url(#fmg)"/>
+<rect x="155" y="124" width="110" height="26" rx="13" fill="rgba(136,135,128,.08)" stroke="#888780" stroke-width="1"/>
+<text x="210" y="141" text-anchor="middle" font-size="12" fill="var(--text-primary)">SiLU</text>
+<line x1="210" y1="150" x2="328" y2="172" stroke="#888780" stroke-width="1.3" marker-end="url(#fmg)"/>
+<line x1="470" y1="106" x2="352" y2="170" stroke="#888780" stroke-width="1.3" marker-end="url(#fmg)"/>
+<circle cx="340" cy="178" r="12" fill="none" stroke="#888780" stroke-width="1.5"/>
+<text x="340" y="183" text-anchor="middle" font-size="12" fill="var(--text-primary)">&#8857;</text>
+<line x1="340" y1="190" x2="340" y2="200" stroke="#888780" stroke-width="1.3" marker-end="url(#fmg)"/>
+<rect x="265" y="202" width="150" height="34" rx="4" fill="rgba(29,158,117,.15)" stroke="#1D9E75" stroke-width="1.2"/>
+<text x="340" y="219" text-anchor="middle" font-size="12" font-weight="500" fill="var(--text-primary)">&times; W_down &rarr; 4096</text>
+<text x="560" y="222" text-anchor="middle" font-size="11" fill="var(--text-muted)">then h &larr; h + this</text>
+</svg>
+
+<h2>5 &middot; The equations, all together</h2>
+<div class="eqcard" style="padding:12px 16px;margin-bottom:12px;">
+<div class="eq" style="line-height:1.9">
+x&#770; = RMSNorm(x) = x / &radic;(mean(x&#178;) + &epsilon;) &#8857; &gamma;<br>
+x &larr; x + W<sub>O</sub>&middot;Concat<sub>i</sub>[ softmax( (x&#770;W<sub>Q</sub><sup>(i)</sup>)(X&#770;W<sub>K</sub><sup>(g(i))</sup>)&#7488; / &radic;128 + M )&middot;X&#770;W<sub>V</sub><sup>(g(i))</sup> ]<br>
+x &larr; x + W<sub>down</sub>&middot;( SiLU(x&#770;&prime;W<sub>gate</sub>) &#8857; x&#770;&prime;W<sub>up</sub> )<br>
+p = softmax( W<sub>head</sub>&middot;h<sup>36</sup><sub>last</sub> )
+</div>
+</div>
+<table>
+<tr class="hd"><td style="width:20%">symbol</td><td style="width:50%">meaning</td><td>Qwen3-8B</td></tr>
+<tr><td class="sym">d_model</td><td class="mean">width of the residual stream</td><td>4096</td></tr>
+<tr><td class="sym">L</td><td class="mean">number of decoder layers</td><td>36</td></tr>
+<tr><td class="sym">h / h_kv</td><td class="mean">query heads / shared k-v heads (GQA)</td><td>32 / 8</td></tr>
+<tr><td class="sym">d_k</td><td class="mean">per-head dimension (the &radic;d_k scale)</td><td>128</td></tr>
+<tr><td class="sym">d_ff</td><td class="mean">FFN intermediate width</td><td>12288</td></tr>
+<tr><td class="sym">|V|</td><td class="mean">vocabulary size (softmax width)</td><td>151936</td></tr>
+<tr><td class="sym">X vs x</td><td class="mean">matrix form (all n tokens) vs one token&rsquo;s row</td><td>papers vs generation</td></tr>
+</table>
+<footer>Built alongside the rag-playground curriculum &mdash; attention weights and token ids are illustrative; shapes and equations match Qwen3-8B.</footer>
+</div>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const NS='http://www.w3.org/2000/svg';
+function el(t,a,p){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e;}
+function txt(x,y,s,size,fill,p,w){const e=el('text',{x:x,y:y,'font-size':size,fill:fill,'text-anchor':'middle'},p);if(w)e.setAttribute('font-weight','500');e.textContent=s;return e;}
+const CX=[140,260,380,500];
+const TN=['the','bank','raised','rates'];
+const W1=[[1.00],[0.30,0.70],[0.10,0.45,0.45],[0.05,0.62,0.24,0.09]];
+const W2=[[1.00],[0.55,0.45],[0.50,0.20,0.30],[0.40,0.15,0.10,0.35]];
+function fmt(a){return '['+a.map(x=>x.toFixed(2)).join(', ')+']';}
+const ACAPS=[
+'1 · tokenize — the prompt becomes token ids.',
+'2 · embed — H⁰ = E[ids]: one 4096-d row per token.',
+'3 · layer 1 projects — its OWN W⁽¹⁾ matrices hit h⁰: fresh q¹, k¹, v¹ for every token.',
+'4 · layer 1 attends & updates — softmax weights w¹, blend, FFN, ADDED to the stream: h¹ = h⁰ + Δ.',
+'5 · layer 2 projects AGAIN — different matrices (W⁽²⁾), different input (h¹). Nothing reused from layer 1.',
+'6 · layer 2 attends — same equation, different weights: w² ≠ w¹. Click tokens to compare.',
+'7 · output head — after 36 layers, p = softmax(W_head·h³⁶ of the LAST token).',
+'8 · sample & append — “sharply” joins; per-layer K/V are cached for the next round.'];
+function aformulaFor(s,f){
+  const n=TN[f];
+  if(s===0)return 'ids = tokenizer(“the bank raised rates”) = [1782, 17032, 9226, 7813]';
+  if(s===1)return 'h⁰<sub>i</sub> = E[id<sub>i</sub>] ∈ ℝ<sup>4096</sup>';
+  if(s===2)return 'q¹<sub>i</sub> = W<sub>Q</sub><sup>(1)</sup>·RMSNorm(h⁰<sub>i</sub>) &nbsp; k¹<sub>i</sub> = W<sub>K</sub><sup>(1)</sup>·… &nbsp; v¹<sub>i</sub> = W<sub>V</sub><sup>(1)</sup>·…';
+  if(s===3)return 'w¹ = softmax(q¹<sub>'+n+'</sub>·k¹<sub>j</sub>/√128) = '+fmt(W1[f])+'<br>h¹<sub>'+n+'</sub> = h⁰<sub>'+n+'</sub> + W<sub>O</sub><sup>(1)</sup>Σw¹<sub>j</sub>v¹<sub>j</sub> + FFN<sup>(1)</sup>(…)';
+  if(s===4)return 'q²<sub>i</sub> = W<sub>Q</sub><sup>(2)</sup>·RMSNorm(h¹<sub>i</sub>) — new matrices AND new input';
+  if(s===5)return 'w² = softmax(q²<sub>'+n+'</sub>·k²<sub>j</sub>/√128) = '+fmt(W2[f])+'<br>compare: w¹ was '+fmt(W1[f]);
+  if(s===6)return 'p = softmax(W<sub>head</sub>·h³⁶<sub>last</sub>) ∈ ℝ<sup>151936</sup>';
+  return 'next ~ p → “sharply” &nbsp;·&nbsp; cache = {k<sup>(l)</sup>, v<sup>(l)</sup>} l = 1…36';
+}
+const ATHR={atk0:0,atk1:0,atk2:0,atk3:0,aarre:1,ah0row:1,ablk1:2,ah1row:3,ablk2:4,ah2row:5,aheadarrow:6,abarsg:6,atk4:7,alooparrow:7};
+const ADUR=[2400,2800,3600,4600,4800,4800,3600,4200];
+let astep=0,afocus=3,aplaying=true,atimer=null;
+function drawALayer(d,top,wts,scored,sup){
+  for(let j=0;j<4;j++){
+    const g=el('g',{},d);
+    if(scored&&j>afocus)g.setAttribute('opacity','0.22');
+    el('line',{x1:CX[j],y1:top+45,x2:CX[j],y2:top+51,stroke:'#888780','stroke-width':1.2,'marker-end':'url(#amg)'},g);
+    const qf=j===afocus;
+    el('rect',{x:CX[j]-39,y:top+54,width:24,height:22,rx:3,fill:qf?'rgba(127,119,221,.22)':'none',stroke:qf?'#7F77DD':'#888780','stroke-width':qf?1.5:1,'stroke-dasharray':qf?'none':'2 2'},g);
+    txt(CX[j]-27,top+69,'q'+sup,11,qf?'var(--text-primary)':'var(--text-muted)',g,qf);
+    el('rect',{x:CX[j]-13,y:top+54,width:24,height:22,rx:3,fill:'rgba(29,158,117,.15)',stroke:'#1D9E75','stroke-width':1},g);
+    txt(CX[j]-1,top+69,'k'+sup,11,'var(--text-primary)',g);
+    el('rect',{x:CX[j]+13,y:top+54,width:24,height:22,rx:3,fill:'none',stroke:'#1D9E75','stroke-width':1,'stroke-dasharray':'3 2'},g);
+    txt(CX[j]+25,top+69,'v'+sup,11,'var(--text-primary)',g);
+  }
+  if(!scored)return;
+  const w=wts[afocus];
+  for(let j=0;j<=afocus;j++){
+    let sx=CX[j]-1,ex=CX[afocus]-27,cy,lx,ly;
+    if(j===afocus){cy=top+104;lx=CX[j]-14;ly=top+97;}
+    else{cy=top+100+(afocus-j)*13;lx=(sx+ex)/2;ly=0.5*(top+78)+0.5*cy+4;}
+    el('path',{d:'M '+sx+' '+(top+78)+' Q '+((sx+ex)/2)+' '+cy+' '+ex+' '+(top+78),fill:'none',stroke:'#7F77DD','stroke-width':1.5,'marker-end':'url(#amp)'},d);
+    txt(lx,ly,w[j].toFixed(2),11,'var(--text-primary)',d,true);
+  }
+  for(let j=0;j<=afocus;j++){
+    el('path',{d:'M '+(CX[j]+25)+' '+(top+78)+' Q '+((CX[j]+25+CX[afocus])/2)+' '+(top+118)+' '+CX[afocus]+' '+(top+113),fill:'none',stroke:'#1D9E75','stroke-width':1.5,'marker-end':'url(#amt)'},d);
+  }
+  el('circle',{cx:CX[afocus],cy:top+124,r:11,fill:'rgba(127,119,221,.18)',stroke:'#7F77DD','stroke-width':1.5},d);
+  txt(CX[afocus],top+128,'Σ',12,'var(--text-primary)',d,true);
+  txt(CX[afocus],top+146,'Σ w·v → ×W_O → +h → FFN',11,'var(--text-muted)',d);
+}
+function adraw(){
+  const d=$('adyn');while(d.firstChild)d.removeChild(d.firstChild);
+  for(let j=0;j<4;j++){
+    const r=$('atkr'+j);
+    r.setAttribute('stroke',j===afocus?'#7F77DD':'#888780');
+    r.setAttribute('stroke-width',j===afocus?'1.6':'1');
+    r.setAttribute('fill',j===afocus?'rgba(127,119,221,.12)':'rgba(136,135,128,.08)');
+    for(const pre of ['anc','amc']){
+      const n=$(pre+j);
+      n.setAttribute('stroke',j===afocus?'#7F77DD':'#1D9E75');
+      n.setAttribute('fill',j===afocus?'rgba(127,119,221,.18)':'rgba(29,158,117,.15)');
+    }
+  }
+  if(astep>=2){const g1=el('g',{},d);if(astep>=4)g1.setAttribute('opacity','0.45');drawALayer(g1,104,W1,astep>=3,'¹');}
+  if(astep>=4){const g2=el('g',{},d);drawALayer(g2,298,W2,astep>=5,'²');}
+}
+function arender(){
+  for(const id in ATHR)$(id).style.opacity=astep>=ATHR[id]?1:0;
+  $('astepn').textContent='step '+(astep+1)+' / 8';
+  $('acap').textContent=ACAPS[astep];
+  $('aformula').innerHTML=aformulaFor(astep,afocus);
+  adraw();
+  for(let i=0;i<3;i++)$('abar'+i).style.transform=astep>=6?'scaleX(1)':'scaleX(0)';
+}
+function asched(){clearTimeout(atimer);if(aplaying)atimer=setTimeout(()=>{astep=(astep+1)%8;arender();asched();},ADUR[astep]);}
+function asetPlay(p){aplaying=p;$('aplay').textContent=p?'pause':'play';asched();}
+$('anext').addEventListener('click',()=>{asetPlay(false);astep=(astep+1)%8;arender();});
+$('aprev').addEventListener('click',()=>{asetPlay(false);astep=(astep+7)%8;arender();});
+$('aplay').addEventListener('click',()=>asetPlay(!aplaying));
+for(let j=0;j<4;j++)$('atk'+j).addEventListener('click',()=>{afocus=j;if(astep<2){astep=2;asetPlay(false);}arender();});
+arender();asched();
+
+const ROWY=[110,148,186,224,262];
+const WSETS=[[0.08,0.31,0.14,0.27,0.20],[0.35,0.10,0.22,0.08,0.25],[0.15,0.20,0.40,0.15,0.10]];
+const BCAPS=[
+'1 · arrive — “sharply” enters layer L with hidden state h. The cache holds k, v for the 4 old tokens; nothing about them is recomputed.',
+'2 · normalize — x̂ = RMSNorm(h), applied before the projections (pre-norm architecture).',
+'3 · project — layer L’s own matrices: fresh q, k, v for the new token only. k and v are appended to the cache; q is kept in hand.',
+'4 · score — q·Kᵀ/√d_k with K = the full cache, softmax → weights. Last position, so the mask M excludes nothing.',
+'5 · blend — softmax(·)·V: values averaged by the weights, ×W_O, added to h. First residual write.',
+'6 · think — FFN_SwiGLU processes the token alone. Second residual write.',
+'7 · exit — h rises to the next layer; q discarded; k₅, v₅ stay cached for token 6.'];
+const BDUR=[3200,2800,3800,4400,3800,3600,4400];
+let bstep=0,BL=12,bplaying=true,btimer=null;
+function bwts(){return WSETS[BL%3];}
+function bformulaFor(s){
+  if(s===0)return 'h ∈ ℝ<sup>4096</sup> (from layer '+(BL-1)+') · cache<sub>'+BL+'</sub> = {(k<sub>j</sub>, v<sub>j</sub>)} j = 1…4';
+  if(s===1)return 'x̂ = RMSNorm(h) = h / √(mean(h²) + ε) ⊙ γ';
+  if(s===2)return 'q = W<sub>Q</sub><sup>('+BL+')</sup>x̂ · k = W<sub>K</sub><sup>('+BL+')</sup>x̂ · v = W<sub>V</sub><sup>('+BL+')</sup>x̂ · cache += (k₅, v₅)';
+  if(s===3)return 's = q·Kᵀ / √d<sub>k</sub> → w = softmax(s + M) = '+fmt(bwts());
+  if(s===4)return 'h ← h + W<sub>O</sub><sup>('+BL+')</sup>·Concat<sub>heads</sub>(w·V)';
+  if(s===5)return 'h ← h + W<sub>down</sub><sup>('+BL+')</sup>(SiLU(W<sub>gate</sub><sup>('+BL+')</sup>x̂′) ⊙ W<sub>up</sub><sup>('+BL+')</sup>x̂′)';
+  return 'h → layer '+(BL+1)+' · cache<sub>'+BL+'</sub> = {(k<sub>j</sub>, v<sub>j</sub>)} j = 1…5';
+}
+const BTHR={btok:0,bh:0,bcache:0,bnorm:1,bchips:2,brow5:2,bkv:2,bblend:4,bffn:5,bout:6};
+function bdraw(){
+  const d=$('bdyn');while(d.firstChild)d.removeChild(d.firstChild);
+  const w=bwts();
+  if(bstep>=3){
+    const g=el('g',{},d);
+    if(bstep>=4)g.setAttribute('opacity','0.3');
+    for(let j=0;j<5;j++){
+      const cy=ROWY[j];
+      el('path',{d:'M 128 162 Q '+((128+496)/2)+' '+(((162+cy)/2)-30)+' 496 '+cy,fill:'none',stroke:'#7F77DD','stroke-width':1.5,'marker-end':'url(#bmp)'},g);
+      const t=el('text',{x:472,y:cy+4,'font-size':11,fill:'var(--text-primary)','text-anchor':'end','font-weight':'500'},g);
+      t.textContent=w[j].toFixed(2);
+    }
+  }
+  if(bstep>=4){
+    for(let j=0;j<5;j++){
+      const cy=ROWY[j];
+      el('path',{d:'M 548 '+cy+' Q '+((548+173)/2)+' '+(((cy+240)/2)+28)+' 173 240',fill:'none',stroke:'#1D9E75','stroke-width':1.3,'stroke-dasharray':'4 3','marker-end':'url(#bmt)'},d);
+    }
+  }
+}
+function brender(){
+  for(const id in BTHR)$(id).style.opacity=bstep>=BTHR[id]?1:0;
+  $('bstepn').textContent='step '+(bstep+1)+' / 7';
+  $('bcap').textContent=BCAPS[bstep];
+  $('bformula').innerHTML=bformulaFor(bstep);
+  $('blval').textContent=BL;
+  $('bclabel').textContent='KV cache — layer '+BL+' only';
+  $('bhin').textContent='h — from layer '+(BL-1);
+  $('bhout').textContent='h — to layer '+(BL+1);
+  bdraw();
+}
+function bsched(){clearTimeout(btimer);if(bplaying)btimer=setTimeout(()=>{bstep=(bstep+1)%7;brender();bsched();},BDUR[bstep]);}
+function bsetPlay(p){bplaying=p;$('bplay2').textContent=p?'pause':'play';bsched();}
+$('bnext2').addEventListener('click',()=>{bsetPlay(false);bstep=(bstep+1)%7;brender();});
+$('bprev2').addEventListener('click',()=>{bsetPlay(false);bstep=(bstep+6)%7;brender();});
+$('bplay2').addEventListener('click',()=>bsetPlay(!bplaying));
+$('bslider').addEventListener('input',e=>{BL=parseInt(e.target.value,10);brender();});
+brender();bsched();
+
+const hg=$('hgroups');
+for(let g=0;g<8;g++){
+  const gx=55+g*72;
+  for(let i=0;i<4;i++){
+    el('rect',{x:gx+i*15,y:38,width:13,height:13,rx:2,fill:'rgba(127,119,221,.22)',stroke:'#7F77DD','stroke-width':1},hg);
+    el('line',{x1:gx+29,y1:88,x2:gx+i*15+6.5,y2:53,stroke:'#888780','stroke-width':0.8},hg);
+  }
+  el('rect',{x:gx,y:88,width:58,height:24,rx:3,fill:'rgba(29,158,117,.15)',stroke:'#1D9E75','stroke-width':1.2},hg);
+  const t=el('text',{x:gx+29,y:104,'font-size':11,fill:'var(--text-primary)','text-anchor':'middle'},hg);
+  t.textContent='k/v '+(g+1);
+  el('line',{x1:gx+29,y1:112,x2:gx+29,y2:156,stroke:'#888780','stroke-width':1,'marker-end':'url(#hmg)'},hg);
+}
+})();
+</script>
+</body>
+</html>
